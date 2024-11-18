@@ -221,6 +221,7 @@ type Binlog struct {
 
 // Inc is the inception section of the config.
 type Inc struct {
+	AlterAutoMerge bool   `toml:"alter_auto_merge" json:"alter_auto_merge"`
 	BackupHost     string `toml:"backup_host" json:"backup_host"` // 远程备份库信息
 	BackupPassword string `toml:"backup_password" json:"backup_password"`
 	BackupPort     uint   `toml:"backup_port" json:"backup_port"`
@@ -250,6 +251,7 @@ type Inc struct {
 	CheckTimestampDefault       bool `toml:"check_timestamp_default" json:"check_timestamp_default"`
 	CheckTimestampCount         bool `toml:"check_timestamp_count" json:"check_timestamp_count"`
 	CheckOfflineDDL             bool `toml:"check_offline_ddl" json:"check_offline_ddl"`
+	CheckToolBasedUniqueIndex   bool `toml:"check_tool_based_unique_index" json:"check_tool_based_unique_index"`
 
 	EnableTimeStampType  bool `toml:"enable_timestamp_type" json:"enable_timestamp_type"`
 	EnableZeroDate       bool `toml:"enable_zero_date" json:"enable_zero_date"`
@@ -305,6 +307,8 @@ type Inc struct {
 	EnableSetCollation bool `toml:"enable_set_collation" json:"enable_set_collation"`
 	// 开启sql统计
 	EnableSqlStatistic bool `toml:"enable_sql_statistic" json:"enable_sql_statistic"`
+	// 在MySQL8.0检测是否支持 ALGORITHM=INSTANT, 当支持时自动关闭pt-osc/gh-ost.
+	EnableDDLInstant bool `toml:"enable_ddl_instant" json:"enable_ddl_instant"`
 
 	// explain判断受影响行数时使用的规则, 默认值"first"
 	// 可选值: "first", "max"
@@ -704,6 +708,7 @@ var defaultConf = Config{
 		CheckIdentifierUpper:  false,
 		CheckIdentifierLower:  false,
 		CheckReadOnly:         true,
+		EnableDDLInstant:      true,
 		SqlSafeUpdates:        -1,
 		LockWaitTimeout:       -1,
 		SupportCharset:        "utf8,utf8mb4",

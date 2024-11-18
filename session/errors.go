@@ -236,6 +236,7 @@ const (
 	ER_CANT_DROP_PARTITION
 	ER_CANT_TRUNCATE_PARTITION
 	ER_CANT_ADD_COLUMNS_AND_CONSTRAINTS_IN_ONE_STATEMENT
+	ER_TOOL_BASED_UNIQUE_INDEX_WARNING
 )
 
 var ErrorsDefault = map[ErrorCode]string{
@@ -439,6 +440,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_CANT_DROP_PARTITION:                               "Can't drop partition '%s'.",
 	ER_CANT_TRUNCATE_PARTITION:                           "Can't truncate partition '%s'.",
 	ER_CANT_ADD_COLUMNS_AND_CONSTRAINTS_IN_ONE_STATEMENT: "Can't add columns and constraints in one statement.",
+	ER_TOOL_BASED_UNIQUE_INDEX_WARNING: "Existing unique indexes may cause duplicate data loss when executing statements using schema-altering tools. It is recommended to review and assess potential risks.",
 }
 
 var ErrorsChinese = map[ErrorCode]string{
@@ -633,6 +635,7 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_CANT_DROP_PARTITION:                               "禁止删除分区 '%s'.",
 	ER_CANT_TRUNCATE_PARTITION:                           "禁止清空分区 '%s'.",
 	ER_CANT_ADD_COLUMNS_AND_CONSTRAINTS_IN_ONE_STATEMENT: "禁止在一条语句中同时添加列和约束.",
+	ER_TOOL_BASED_UNIQUE_INDEX_WARNING:     "存在唯一索引，使用改表工具执行语句可能导致重复数据丢失，建议复查是否存在风险",
 }
 
 func GetErrorLevel(code ErrorCode) uint8 {
@@ -699,7 +702,8 @@ func GetErrorLevel(code ErrorCode) uint8 {
 		ErrImplicitTypeConversion,
 		ErrUseValueExpr,
 		ErrMaxColumnCount,
-		ER_WITH_INSERT_FIELD:
+		ER_WITH_INSERT_FIELD,
+		ER_TOOL_BASED_UNIQUE_INDEX_WARNING:
 		return 1
 
 	case ER_CONFLICTING_DECLARATIONS,
@@ -1169,6 +1173,9 @@ func (e ErrorCode) String() string {
 		return "er_max_column_count"
 	case ER_ERROR_LAST:
 		return "er_error_last"
+	case ER_TOOL_BASED_UNIQUE_INDEX_WARNING:
+		return "er_tool_based_unique_index_warning"
+
 	}
 	return ""
 }

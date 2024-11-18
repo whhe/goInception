@@ -318,6 +318,36 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 					s.initDisableTypes()
 					continue
 				case *ast.InceptionCommitStmt:
+					/******* jwx added 将对同一个表的多条alter语句合并成一条 ******/
+					if s.inc.AlterAutoMerge && s.opt.Check && !s.opt.Execute {
+						for _, info := range s.alterTableInfoList {
+							if len(info.alterStmtList) >= 2 {
+								merged := info.alterStmtList[0]
+								for seq, alterStmt := range info.alterStmtList {
+									if seq > 0 {
+										merged.Specs = append(merged.Specs, alterStmt.Specs...)
+									}
+								}
+								var builder strings.Builder
+								_ = merged.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+								info.mergedSql = builder.String()
+								mergedRecord := &Record{
+									Sql:          info.mergedSql,
+									Buf:          new(bytes.Buffer),
+									Type:         &merged,
+									Stage:        StageCheck,
+									ErrorMessage: "MERGED",
+									NeedMerge:    -1,
+								}
+								s.recordSets.Append(mergedRecord)
+								for _, pos := range info.recordSetsPosList {
+									s.recordSets.records[pos].NeedMerge = s.recordSets.SeqNo
+								}
+							}
+
+						}
+					}
+					/****************/
 
 					if !s.haveBegin {
 						s.appendErrorMsg("Must start as begin statement.")
@@ -606,7 +636,7 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 	case *ast.CreateTableStmt:
 		s.checkCreateTable(node, currentSql)
 	case *ast.AlterTableStmt:
-		s.checkAlterTable(node, currentSql)
+		s.checkAlterTable(node, currentSql, false)
 	case *ast.DropTableStmt:
 		s.checkDropTable(node, currentSql)
 	case *ast.RenameTableStmt:
@@ -629,11 +659,24 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 		if node.KeyType == ast.IndexKeyTypeFullText {
 			tp = ast.ConstraintFulltext
 		}
-		s.checkCreateIndex(node.Table, node.IndexName,
-			node.IndexColNames, node.IndexOption, nil, node.Unique, tp)
+		if !s.inc.AlterAutoMerge { // jwx added
+			s.checkCreateIndex(node.Table, node.IndexName,
+				node.IndexColNames, node.IndexOption, nil, node.Unique, tp)
+		} else {
+			alter := s.convertCreateIndexToAlterTable(node)
+			s.checkAlterTable(alter, node.Text(), true)
+			s.checkCreateIndex(node.Table, node.IndexName,
+				node.IndexColNames, node.IndexOption, nil, node.Unique, tp)
+		}
 
 	case *ast.DropIndexStmt:
-		s.checkDropIndex(node, currentSql)
+		if !s.inc.AlterAutoMerge { // jwx added
+			s.checkDropIndex(node, currentSql)
+		} else {
+			alter := s.convertDropIndexToAlterTable(node)
+			s.checkAlterTable(alter, node.Text(), true)
+			s.checkDropIndex(node, currentSql)
+		}
 
 	case *ast.CreateViewStmt:
 		s.checkCreateView(node, currentSql)
@@ -3294,7 +3337,7 @@ func (s *session) checkTableCharsetCollation(character, collation string) {
 	}
 }
 
-func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
+func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string, mergeOnly bool) {
 	log.Debug("checkAlterTable")
 
 	if node.Table.Schema.O == "" {
@@ -3309,6 +3352,34 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 	if table == nil {
 		return
 	}
+
+	/*********** jwx added **********/
+	if s.inc.AlterAutoMerge {
+		tableNameInString := fmt.Sprintf("%s.%s", node.Table.Schema.O, node.Table.Name.O)
+		var found bool = false
+		var seq int = 0
+		for j, i := range s.alterTableInfoList {
+			if tableNameInString == i.Name {
+				found = true
+				seq = j
+				break
+			}
+		}
+		if found {
+			s.alterTableInfoList[seq].alterStmtList = append(s.alterTableInfoList[seq].alterStmtList, *node)
+			s.alterTableInfoList[seq].recordSetsPosList = append(s.alterTableInfoList[seq].recordSetsPosList, s.recordSets.SeqNo)
+		} else {
+			var info alterTableInfo = alterTableInfo{Name: tableNameInString}
+			info.alterStmtList = append(info.alterStmtList, *node)
+			info.recordSetsPosList = append(info.recordSetsPosList, s.recordSets.SeqNo)
+			s.alterTableInfoList = append(s.alterTableInfoList, info)
+		}
+
+		if mergeOnly {
+			return
+		}
+	}
+	/******************************/
 
 	table.AlterCount += 1
 
@@ -3354,13 +3425,13 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 
 	// 设置osc开关
 	s.checkAlterUseOsc(table)
+	s.checkDDLInstant(node, table)
 
 	// 如果修改了表名,则调整回滚语句
 	hasRenameTable := false
 	for _, alter := range node.Specs {
 		if alter.Tp == ast.AlterTableRenameTable {
 			hasRenameTable = true
-			s.myRecord.useOsc = false
 			break
 		}
 	}
@@ -3423,6 +3494,7 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 		s.appendErrorNo(ER_NOT_SUPPORTED_YET)
 		return
 	}
+
 
 	var addColumnAndIndex = 0
 	for i, alter := range node.Specs {
@@ -3624,6 +3696,140 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 			s.appendErrorMsg(err.Error())
 			return
 		}
+	}
+}
+
+// checkDDLInstantMySQL57
+func checkDDLInstantMySQL57(node *ast.AlterTableStmt) (canInstant bool) {
+	// 如果mysql版本小于8.0,只有VIRTUAL column支持Only Modifies Metadata
+	for _, alter := range node.Specs {
+		switch alter.Tp {
+		case ast.AlterTableAddColumns:
+			newColumns := len(alter.NewColumns)
+			virtualColumns := 0
+			for _, nc := range alter.NewColumns {
+				isPrimary := false
+				isUnique := false
+				var isStore *bool
+				for _, op := range nc.Options {
+					switch op.Tp {
+					case ast.ColumnOptionPrimaryKey:
+						isPrimary = true
+					case ast.ColumnOptionUniqKey:
+						isUnique = true
+					case ast.ColumnOptionGenerated:
+						isStore = &op.Stored
+					}
+				}
+
+				if !isPrimary && !isUnique {
+					if isStore != nil && !*isStore {
+						virtualColumns++
+					}
+				}
+			}
+			if virtualColumns == newColumns {
+				canInstant = true
+				return
+			}
+		default:
+			return
+		}
+	}
+	return false
+}
+
+// checkDDLInstantMySQL80
+func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion int) (canInstant bool) {
+	canInstantSpecs := 0
+	for _, alter := range node.Specs {
+		// 当用户指定了 ALGORITHM=INSTANT 时,忽略检查并关闭osc
+		if alter.Algorithm == ast.AlgorithmTypeInstant {
+			canInstant = true
+			return
+		}
+
+		switch alter.Tp {
+		case ast.AlterTableAddColumns:
+			newColumns := len(alter.NewColumns)
+			virtualColumns := 0
+			for _, nc := range alter.NewColumns {
+				isPrimary := false
+				isUnique := false
+				var isStore *bool
+				for _, op := range nc.Options {
+					switch op.Tp {
+					case ast.ColumnOptionPrimaryKey:
+						isPrimary = true
+					case ast.ColumnOptionUniqKey:
+						isUnique = true
+					case ast.ColumnOptionGenerated:
+						isStore = &op.Stored
+					}
+				}
+
+				if !isPrimary && !isUnique {
+					// 此时已经排除主键/唯一键的情况
+					// 8.0版本下只有STORED column不支持Only Modifies Metadata
+					if isStore == nil || !*isStore {
+						virtualColumns++
+					}
+				}
+			}
+			if alter.Position.Tp != ast.ColumnPositionNone {
+				if dbVersion < 80029 {
+					return
+				} else {
+					canInstantSpecs++
+				}
+			}
+			if virtualColumns == newColumns {
+				canInstantSpecs++
+			} else {
+				return
+			}
+
+		case ast.AlterTableDropColumn:
+			for _, field := range t.Fields {
+				if strings.EqualFold(field.Field, alter.OldColumnName.Name.O) && !field.IsDeleted {
+					if strings.Contains(field.Extra, "VIRTUAL") {
+						canInstantSpecs++
+					}
+					break
+				}
+			}
+
+		case ast.AlterTableRenameTable:
+			canInstantSpecs++
+
+		case ast.AlterTableAlterColumn:
+			canInstantSpecs++
+
+		default:
+			return
+		}
+	}
+	if canInstantSpecs == len(node.Specs) {
+		canInstant = true
+	}
+	return canInstant
+}
+
+// checkDDLInstant 检查是否支持 ALGORITHM=INSTANT, 当支持时自动关闭pt-osc/gh-ost.
+func (s *session) checkDDLInstant(node *ast.AlterTableStmt, t *TableInfo) {
+	if !s.inc.EnableDDLInstant || !s.myRecord.useOsc || s.dbVersion < 50700 {
+		return
+	}
+
+	if s.dbVersion < 80000 {
+		if checkDDLInstantMySQL57(node) {
+			s.myRecord.useOsc = false
+		}
+		return
+	}
+
+	if checkDDLInstantMySQL80(node, t, s.dbVersion) {
+		s.myRecord.useOsc = false
 	}
 }
 
@@ -5035,16 +5241,6 @@ func (s *session) checkAddColumn(t *TableInfo, c *ast.AlterTableSpec) {
 						}
 						t.Indexes = append(t.Indexes, index)
 					}
-				} else {
-					// 此时已经排除主键/唯一键的情况
-					// 8.0版本下只有STORED column不支持Only Modifies Metadata
-					if s.dbVersion >= 80000 && (nil == isStore || !*isStore) {
-						s.myRecord.useOsc = false
-					}
-					// 如果mysql版本小于8.0,只有VIRTUAL column支持Only Modifies Metadata
-					if s.dbVersion < 80000 && nil != isStore && !*isStore {
-						s.myRecord.useOsc = false
-					}
 				}
 			}
 
@@ -5442,6 +5638,10 @@ func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
 		}
 		t.Indexes = append(t.Indexes, index)
 	}
+	// 只有在使用改表工具时，会提示唯一索引风险
+	if s.myRecord.useOsc && unique == true {
+		s.appendErrorNo(ER_TOOL_BASED_UNIQUE_INDEX_WARNING)
+	}
 
 	if s.opt.Execute {
 		var rollbackSql string
@@ -5587,6 +5787,52 @@ func (s *session) checkAddConstraint(t *TableInfo, c *ast.AlterTableSpec) {
 		s.appendErrorNo(ER_NOT_SUPPORTED_YET)
 		log.Info("con:", s.sessionVars.ConnectionID, " 未定义的解析: ", c.Constraint.Tp)
 	}
+}
+
+func (s *session) convertCreateIndexToAlterTable(node *ast.CreateIndexStmt) *ast.AlterTableStmt {
+	log.Debug("convertCreateIndexToAlterTable")
+	var alter *ast.AlterTableStmt = &ast.AlterTableStmt{Specs: []*ast.AlterTableSpec{}}
+	var spec *ast.AlterTableSpec = &ast.AlterTableSpec{Tp: ast.AlterTableAddConstraint, Constraint: &ast.Constraint{}}
+	spec.IfNotExists = node.IfNotExists
+	spec.Constraint.Name = node.IndexName
+	if node.Unique {
+		spec.Constraint.Tp = ast.ConstraintUniq
+	} else {
+		spec.Constraint.Tp = ast.ConstraintIndex
+	}
+	spec.Constraint.Keys = node.IndexColNames
+	spec.Constraint.Option = node.IndexOption
+	if node.LockAlg != nil {
+		spec.LockType = node.LockAlg.LockTp
+		spec.Algorithm = node.LockAlg.AlgorithmTp
+	} else {
+		spec.LockType = 0
+		spec.Algorithm = 0
+	}
+	spec.Partition = node.Partition
+	alter.SetText(node.Text())
+	alter.Table = node.Table
+	alter.Specs = append(alter.Specs, spec)
+	return alter
+}
+
+func (s *session) convertDropIndexToAlterTable(node *ast.DropIndexStmt) *ast.AlterTableStmt {
+	log.Debug("convertDropIndexToAlterTable")
+	var alter *ast.AlterTableStmt = &ast.AlterTableStmt{Specs: []*ast.AlterTableSpec{}}
+	var spec *ast.AlterTableSpec = &ast.AlterTableSpec{Tp: ast.AlterTableDropIndex}
+	spec.IfExists = node.IfExists
+	spec.Name = node.IndexName
+	if node.LockAlg != nil {
+		spec.LockType = node.LockAlg.LockTp
+		spec.Algorithm = node.LockAlg.AlgorithmTp
+	} else {
+		spec.LockType = 0
+		spec.Algorithm = 0
+	}
+	alter.SetText(node.Text())
+	alter.Table = node.Table
+	alter.Specs = append(alter.Specs, spec)
+	return alter
 }
 
 func (s *session) checkDBExists(db string, reportNotExists bool) bool {
@@ -8223,6 +8469,8 @@ func (s *session) checkInceptionVariables(number ErrorCode) bool {
 		return s.inc.CheckIdentifierLower
 	case ErCantChangeColumn:
 		return !s.inc.EnableChangeColumn
+	case ER_TOOL_BASED_UNIQUE_INDEX_WARNING:
+		return s.inc.CheckToolBasedUniqueIndex
 	}
 
 	return true
