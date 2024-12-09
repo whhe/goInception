@@ -3532,7 +3532,8 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string, mergeOnl
 	}
 
 
-	var addColumnAndIndex = 0
+	var addColumn = 0
+	var addConstraint = 0
 	for i, alter := range node.Specs {
 		switch alter.Tp {
 		case ast.AlterTableOption:
@@ -3544,12 +3545,12 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string, mergeOnl
 
 		case ast.AlterTableAddColumns:
 			s.checkAddColumn(table, alter)
-			addColumnAndIndex += 1
+			addColumn += 1
 		case ast.AlterTableDropColumn:
 			s.checkDropColumn(table, alter)
 
 		case ast.AlterTableAddConstraint:
-			addColumnAndIndex += 1
+			addConstraint += 1
 			s.checkAddConstraint(table, alter)
 
 		case ast.AlterTableDropPrimaryKey:
@@ -3672,7 +3673,7 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string, mergeOnl
 	}
 
 	if s.dbType == DBTypeOceanBase && s.inc.CheckOfflineDDL {
-		if addColumnAndIndex >= 2 {
+		if addColumn >= 1 && addConstraint >= 1 {
 			s.appendErrorNo(ER_CANT_ADD_COLUMNS_AND_CONSTRAINTS_IN_ONE_STATEMENT)
 		}
 	}
@@ -4393,7 +4394,16 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 			case mysql.TypeDecimal, mysql.TypeNewDecimal,
 				mysql.TypeVarchar,
 				mysql.TypeVarString:
-				str := string([]byte(foundField.Type)[:7])
+				/* 
+				这里如果foundField.Type的长度不足7位，直接取[:7],会导致数据越界
+				所以如果foundField.Type长度小于7位，以实际长度进行截取，如果大于等于7位，就按照7位进行截取 
+				*/
+				length := 7
+				legnthOfFoundFieldType := len(foundField.Type)
+				if legnthOfFoundFieldType < length {
+					length = legnthOfFoundFieldType
+				}
+				str := string([]byte(foundField.Type)[:length])
 				// 类型不一致
 				if !strings.Contains(fieldType, str) {
 					s.appendErrorNo(ER_CHANGE_COLUMN_TYPE,
