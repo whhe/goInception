@@ -1210,6 +1210,7 @@ func (s *session) executeTransaction(records []*Record) int {
 		}
 
 		if len(errs) > 0 {
+			tx.Rollback()
 			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, errs)
 
 			for j := range records {
