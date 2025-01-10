@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+	"strings"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jinzhu/gorm"
@@ -149,6 +150,32 @@ func (s *session) rawScan(sqlStr string, dest interface{}) (err error) {
 	// 连接断开无效时,自动重试
 	for i := 0; i < maxBadConnRetries; i++ {
 		err = s.db.Raw(sqlStr).Scan(dest).Error
+		// Scan方法无法直接把EXPLAIN查询的结果映射到dest即OceanBaseQueryPlan，只读取了第一行
+		// 所以这里手动把每一行拼一下，赋值给OceanBaseQueryPlan.QueryPlan
+		// FORMAT=JSON是OB独有的，所以这里是只处理了OB的EXPLAIN语句
+		if strings.Contains(sqlStr,"EXPLAIN FORMAT=JSON") {
+			rows, err := s.db.Raw(sqlStr).Rows()
+			defer rows.Close()
+			if err != nil {
+				return err
+			}
+			var queryPlanSlice []string
+			for rows.Next(){
+				var line string
+				if err := rows.Scan(&line); err != nil {
+					return err
+				}
+				// 将每一行添加到queryPalnList切片中
+				queryPlanSlice = append(queryPlanSlice, line) 
+			}
+			// 将切片转换为字符串
+			queryPlanString := strings.Join(queryPlanSlice, "")
+			// 使用类型断言将 dest 转换为 *OceanBaseQueryPlan
+			if queryPlan, ok := dest.(*OceanBaseQueryPlan); ok {
+				// 将拼接后的字符串赋值给OceanBaseQueryPlan变量
+				queryPlan.QueryPlan = queryPlanString
+			}
+		}
 		if err == nil {
 			return
 		}
